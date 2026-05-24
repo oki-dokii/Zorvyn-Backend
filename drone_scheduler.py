@@ -298,7 +298,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         # Pre-filter pending: drop items whose direct-from-warehouse arrival
         # from the earliest-free drone (= this drone) already exceeds their
         # deadline. Drone-times only increase, so these items can never be
-        # delivered on-time by any drone — dropping them avoids wasted energy
+        # delivered on-time by any drone -- dropping them avoids wasted energy
         # and stops the candidate scan window from filling with skip-late
         # entries.
         new_pending = []
