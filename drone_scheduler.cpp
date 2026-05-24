@@ -763,8 +763,8 @@ int main() {
     string input;
     {
         char buf[1 << 16];
-        ssize_t r;
-        while ((r = read(0, buf, sizeof(buf))) > 0) input.append(buf, r);
+        size_t r;
+        while ((r = fread(buf, 1, sizeof(buf), stdin)) > 0) input.append(buf, r);
     }
     P = input.c_str();
     JsonVal root = parseVal();
