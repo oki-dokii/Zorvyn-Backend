@@ -125,6 +125,10 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 nfz_norm.append(('r', T_start, T_end, min(xs), min(ys), max(xs), max(ys)))
 
     have_nfz = bool(nfz_norm)
+    # Only fold NFZ-wait into per-perm eval for small inputs; for large
+    # inputs the cost (brute force over many perms) becomes prohibitive
+    # and trip_actual_score still handles NFZ correctly for final scoring.
+    eval_uses_nfz = have_nfz and len(deliveries) <= 500
 
     def nfz_wait_until(p1, p2, t_depart):
         if not have_nfz:
@@ -198,8 +202,13 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         on_time = 0
         px, py = wx, wy
         for d in perm:
-            dxv = px - d['x']
-            dyv = py - d['y']
+            nxt = (float(d['x']), float(d['y']))
+            if eval_uses_nfz:
+                t_wait = nfz_wait_until((px, py), nxt, t)
+                if t_wait > t:
+                    t = t_wait
+            dxv = px - nxt[0]
+            dyv = py - nxt[1]
             leg = math.sqrt(dxv * dxv + dyv * dyv)
             t += leg / SPEED
             e += leg * (1.0 + carried)
@@ -207,13 +216,107 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             if t <= dl:
                 on_time += 1
             carried -= float(d['weight'])
-            px, py = d['x'], d['y']
+            px, py = nxt[0], nxt[1]
+        if eval_uses_nfz:
+            t_wait = nfz_wait_until((px, py), (wx, wy), t)
+            if t_wait > t:
+                t = t_wait
         dxv = px - wx
         dyv = py - wy
         leg_r = math.sqrt(dxv * dxv + dyv * dyv)
         e += leg_r
         t_end = t + leg_r / SPEED
         return (e, on_time, t_end)
+
+    def trip_actual_score(perm, depart_t):
+        """Simulate the trip including NFZ waits and min-charge stops. Returns
+        (on_time_count, energy, t_end). Returns (0, 1e18, 1e18) on infeasibility."""
+        if not perm:
+            return (0, 0.0, depart_t)
+        n = len(perm)
+        positions = [(wx, wy)] + [(p['x'], p['y']) for p in perm] + [(wx, wy)]
+        carrieds = [0.0] * (n + 1)
+        total_w = 0.0
+        for p in perm:
+            total_w += float(p['weight'])
+        carrieds[0] = total_w
+        for i in range(1, n + 1):
+            carrieds[i] = carrieds[i - 1] - float(perm[i - 1]['weight'])
+        leg_energies = [0.0] * (n + 1)
+        for i in range(n + 1):
+            ld = dist(positions[i], positions[i + 1])
+            leg_energies[i] = ld * (1.0 + carrieds[i])
+        suffix_e = [0.0] * (n + 2)
+        for i in range(n, -1, -1):
+            suffix_e[i] = suffix_e[i + 1] + leg_energies[i]
+        pos = positions[0]
+        battery = BATTERY_CAP
+        t = depart_t
+        energy = 0.0
+        on_time = 0
+        SAFETY = 1e-6
+        for i in range(n + 1):
+            target = positions[i + 1]
+            carried = carrieds[i]
+            future_after = suffix_e[i + 1]
+            for _ in range(8):
+                leg_d = dist(pos, target)
+                leg_e = leg_d * (1.0 + carried)
+                if leg_e <= battery + SAFETY:
+                    break
+                if not have_cs:
+                    return (0, 1e18, 1e18)
+                best = None
+                best_extra = INF
+                for cs in cs_points:
+                    e_to = dist(pos, cs) * (1.0 + carried)
+                    if e_to > battery + SAFETY:
+                        continue
+                    e_from = dist(cs, target) * (1.0 + carried)
+                    if e_from > BATTERY_CAP + SAFETY:
+                        continue
+                    extra = e_to + e_from - leg_e
+                    if extra < best_extra:
+                        best_extra = extra
+                        best = (cs, e_to, e_from)
+                if best is None:
+                    return (0, 1e18, 1e18)
+                cs, e_to, e_from = best
+                d_to_cs = dist(pos, cs)
+                if have_nfz:
+                    tw = nfz_wait_until(pos, cs, t)
+                    if tw > t:
+                        t = tw
+                t += d_to_cs / SPEED
+                battery -= e_to
+                energy += e_to
+                pos = cs
+                needed = e_from + future_after
+                target_battery = needed
+                if target_battery > BATTERY_CAP:
+                    target_battery = BATTERY_CAP
+                charge_amount = target_battery - battery
+                if charge_amount < 0.0:
+                    charge_amount = 0.0
+                t += charge_amount / CHARGE_RATE
+                battery += charge_amount
+            else:
+                return (0, 1e18, 1e18)
+            if have_nfz:
+                tw = nfz_wait_until(pos, target, t)
+                if tw > t:
+                    t = tw
+            leg_d = dist(pos, target)
+            leg_e = leg_d * (1.0 + carried)
+            battery -= leg_e
+            energy += leg_e
+            t += leg_d / SPEED
+            pos = target
+            if i < n:
+                dl = perm[i].get('deadline', INF)
+                if t <= dl:
+                    on_time += 1
+        return (on_time, energy, t)
 
     def is_trip_feasible(perm):
         """Simulate the trip exactly as execution will: charge MINIMALLY at
@@ -468,57 +571,67 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         if not pending:
             break
 
-        # First try the strict no-charge cap so the common case stays cheap
-        # (charging would add detour + charge time = lost on-time deliveries).
-        pack_a = pack_by_deadline(pending, max_payload, depart_t, BATTERY_CAP)
-        sa = pack_score(pack_a, depart_t)
-        if len(pack_a) >= MAX_TRIP_SIZE and sa[0] == len(pack_a):
-            chosen = pack_a
-        else:
-            pack_b = pack_by_cluster(pending, max_payload, depart_t, BATTERY_CAP)
-            sb = pack_score(pack_b, depart_t)
-            key_a = (-sa[0], sa[1], sa[2])
-            key_b = (-sb[0], sb[1], sb[2])
-            chosen = pack_a if key_a <= key_b else pack_b
-
-        # Rescue pass: if the strict cap couldn't pack anything but charging
-        # stations are available, try again with the relaxed cap.
-        if not chosen and have_cs and TRIP_ENERGY_CAP > BATTERY_CAP:
-            pack_a = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
-            sa = pack_score(pack_a, depart_t)
-            pack_b = pack_by_cluster(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
-            sb = pack_score(pack_b, depart_t)
-            key_a = (-sa[0], sa[1], sa[2])
-            key_b = (-sb[0], sb[1], sb[2])
-            chosen = pack_a if key_a <= key_b else pack_b
+        # Always run the strict-cap pack first.
+        pack_strict_a = pack_by_deadline(pending, max_payload, depart_t, BATTERY_CAP)
+        pack_strict_b = pack_by_cluster(pending, max_payload, depart_t, BATTERY_CAP)
+        # Run the relaxed-cap (charging-aware) pack too when it could plausibly
+        # add deliveries beyond what the strict pack covers.
+        pack_relaxed_a = []
+        pack_relaxed_b = []
+        if have_cs and TRIP_ENERGY_CAP > BATTERY_CAP:
+            strict_size = max(len(pack_strict_a), len(pack_strict_b))
+            if strict_size < MAX_TRIP_SIZE:
+                pack_relaxed_a = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
+                pack_relaxed_b = pack_by_cluster(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
+        # Score each pack with the realistic simulator (handles charging + NFZ).
+        best_ordered = None
+        best_key = None
+        best_t_end_est = depart_t
+        for p in (pack_strict_a, pack_strict_b, pack_relaxed_a, pack_relaxed_b):
+            if not p:
+                continue
+            ordered_p, _, _, _ = best_route(p, depart_t)
+            # Trim infeasible tails so trip_actual_score won't reject.
+            while ordered_p:
+                if have_cs:
+                    if is_trip_feasible(ordered_p):
+                        break
+                else:
+                    _, e_test, _ = eval_perm(ordered_p, depart_t)
+                    if e_test <= BATTERY_CAP:
+                        break
+                drop_idx = 0
+                drop_dl = ordered_p[0].get('deadline', INF)
+                for k in range(1, len(ordered_p)):
+                    dlk = ordered_p[k].get('deadline', INF)
+                    if dlk > drop_dl:
+                        drop_dl = dlk
+                        drop_idx = k
+                ordered_p.pop(drop_idx)
+                if ordered_p:
+                    ordered_p, _, _, _ = best_route(ordered_p, depart_t)
+            if not ordered_p:
+                continue
+            sim_ot, sim_e, sim_t_end = trip_actual_score(ordered_p, depart_t)
+            if sim_e >= 1e17:
+                continue
+            key = (-sim_ot, sim_e, sim_t_end)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_ordered = ordered_p
+                best_t_end_est = sim_t_end
+        chosen = best_ordered if best_ordered else []
 
         if not chosen:
             active_drone_ids.remove(did)
             continue
 
-        ordered, energy, _ot, _t_end = best_route(chosen, depart_t)
-
-        # Drop tail (latest deadline first) until the trip is feasible.
-        # Without charging stations, "feasible" means energy <= BATTERY_CAP.
-        # With charging stations, we use a full simulation that inserts
-        # charge stops as needed.
-        def trip_ok(o, e):
-            if not o:
-                return True
-            if have_cs:
-                return is_trip_feasible(o)
-            return e <= BATTERY_CAP
-        while ordered and not trip_ok(ordered, energy):
-            drop_idx = 0
-            drop_dl = ordered[0].get('deadline', INF)
-            for k in range(1, len(ordered)):
-                dlk = ordered[k].get('deadline', INF)
-                if dlk > drop_dl:
-                    drop_dl = dlk
-                    drop_idx = k
-            ordered.pop(drop_idx)
-            if ordered:
-                ordered, energy, _ot, _t_end = best_route(ordered, depart_t)
+        # chosen is already optimally routed and feasibility-trimmed above.
+        ordered = chosen
+        if ordered:
+            _, energy, _ot, _t_end = best_route(ordered, depart_t)
+        else:
+            energy = 0.0
 
         if not ordered:
             active_drone_ids.remove(did)
