@@ -37,6 +37,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
 
     BATTERY_CAP = 500.0
     SPEED = 1.0
+    CHARGE_RATE = 2.0  # energy units per timestep (matches problem statement)
     MAX_TRIP_SIZE = 12
     MAX_CANDIDATES_SCAN = 200
     BRUTE_LIMIT = 7
@@ -445,10 +446,11 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         pos = (wx, wy)
         carried = sum(float(d['weight']) for d in ordered)
 
-        def maybe_charge(target_pos, carried):
+        def maybe_charge(target_pos, carried, future_needed):
             """If the next leg pos->target_pos would deplete the battery,
-            divert via the cheapest reachable charging station. Iterative to
-            avoid recursion blow-up; bounded by MAX_CHARGES_PER_LEG."""
+            divert via the cheapest reachable charging station and charge
+            JUST enough for (leg_to_target + future_needed) so makespan is
+            minimized. Iterative; bounded by MAX_CHARGES_PER_LEG."""
             if not have_cs:
                 return
             MAX_CHARGES_PER_LEG = 6
@@ -457,9 +459,9 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 leg_e = leg * (1.0 + carried)
                 if leg_e <= st['battery']:
                     return
-                # Find best charging station: minimum (to-cs + from-cs - leg).
                 best_cs = None
                 best_extra = INF
+                best_d_to = 0.0
                 for cs in cs_points:
                     d_to = dist(pos_ref[0], cs)
                     e_to = d_to * (1.0 + carried)
@@ -473,14 +475,11 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                         best_d_to = d_to
                 if best_cs is None:
                     return
-                # Refuse to add a charging detour that does not strictly
-                # improve our ability to make the leg (avoid infinite loop
-                # when no charge would bring us any closer to target).
-                # The charge is useful iff after charging at best_cs, the
-                # remaining leg from best_cs to target fits a full battery.
-                remaining_e = dist(best_cs, target_pos) * (1.0 + carried)
-                if remaining_e > BATTERY_CAP:
-                    return  # can't reach target from this charger either
+                # Energy from charger onward (leg to target + remaining trip)
+                e_cs_to_target = dist(best_cs, target_pos) * (1.0 + carried)
+                needed_from_cs = e_cs_to_target + future_needed
+                if e_cs_to_target > BATTERY_CAP:
+                    return
                 depart = nfz_wait_until(pos_ref[0], best_cs, st['t'])
                 if depart > st['t']:
                     st['path'].append({
@@ -494,7 +493,16 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                     'x': best_cs[0], 'y': best_cs[1],
                     't': round(st['t'], 6), 'action': 'CHARGE',
                 })
-                st['battery'] = BATTERY_CAP
+                # Charge to the minimum needed (capped at BATTERY_CAP).
+                target_battery = needed_from_cs
+                if target_battery > BATTERY_CAP:
+                    target_battery = BATTERY_CAP
+                charge_amount = target_battery - st['battery']
+                if charge_amount < 0.0:
+                    charge_amount = 0.0
+                charge_time = charge_amount / CHARGE_RATE
+                st['t'] += charge_time
+                st['battery'] += charge_amount
                 st['path'].append({
                     'x': best_cs[0], 'y': best_cs[1],
                     't': round(st['t'], 6), 'action': 'CHARGE_COMPLETE',
@@ -503,9 +511,28 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
 
         pos_ref = [pos]
 
-        for d in ordered:
+        # Precompute leg energies and a suffix-sum of remaining trip energy
+        # so charging can stop as soon as it has enough to finish the trip.
+        n_ord = len(ordered)
+        positions = [(wx, wy)] + [(d['x'], d['y']) for d in ordered] + [(wx, wy)]
+        carried_at_leg = [0.0] * (n_ord + 1)
+        carried_at_leg[0] = sum(float(d['weight']) for d in ordered)
+        for i in range(1, n_ord + 1):
+            carried_at_leg[i] = carried_at_leg[i - 1] - float(ordered[i - 1]['weight'])
+        leg_energies = [0.0] * (n_ord + 1)
+        for i in range(n_ord + 1):
+            ld = dist(positions[i], positions[i + 1])
+            leg_energies[i] = ld * (1.0 + carried_at_leg[i])
+        # suffix_e[i] = energy of legs i..n_ord
+        suffix_e = [0.0] * (n_ord + 2)
+        for i in range(n_ord, -1, -1):
+            suffix_e[i] = suffix_e[i + 1] + leg_energies[i]
+
+        for idx, d in enumerate(ordered):
             nxt_pos = (float(d['x']), float(d['y']))
-            maybe_charge(nxt_pos, carried)
+            # future_needed = energy of legs AFTER this one (idx+1..n_ord)
+            future_needed = suffix_e[idx + 1]
+            maybe_charge(nxt_pos, carried, future_needed)
             depart = nfz_wait_until(pos_ref[0], nxt_pos, st['t'])
             if depart > st['t']:
                 st['path'].append({
@@ -528,7 +555,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             carried -= float(d['weight'])
             pos_ref[0] = nxt_pos
 
-        maybe_charge((wx, wy), carried)
+        maybe_charge((wx, wy), carried, 0.0)
         depart = nfz_wait_until(pos_ref[0], (wx, wy), st['t'])
         if depart > st['t']:
             st['path'].append({
