@@ -672,18 +672,18 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                     if e_to > st['battery']:
                         continue
                     d_from = dist(cs, target_pos)
-                    extra = e_to + d_from * (1.0 + carried) - leg_e
+                    e_from = d_from * (1.0 + carried)
+                    if e_from > BATTERY_CAP:
+                        continue
+                    extra = e_to + e_from - leg_e
                     if extra < best_extra:
                         best_extra = extra
                         best_cs = cs
                         best_d_to = d_to
                 if best_cs is None:
                     return
-                # Energy from charger onward (leg to target + remaining trip)
                 e_cs_to_target = dist(best_cs, target_pos) * (1.0 + carried)
                 needed_from_cs = e_cs_to_target + future_needed
-                if e_cs_to_target > BATTERY_CAP:
-                    return
                 depart = nfz_wait_until(pos_ref[0], best_cs, st['t'])
                 if depart > st['t']:
                     st['path'].append({
