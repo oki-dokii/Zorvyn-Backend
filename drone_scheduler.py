@@ -52,7 +52,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
     # If charging is available, allow trips with effective higher energy ceiling;
     # actual execution will insert CHARGE stops as needed.
     if have_cs:
-        TRIP_ENERGY_CAP = BATTERY_CAP * 3.0
+        TRIP_ENERGY_CAP = BATTERY_CAP * 2.0
     else:
         TRIP_ENERGY_CAP = BATTERY_CAP
 
@@ -214,6 +214,76 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         e += leg_r
         t_end = t + leg_r / SPEED
         return (e, on_time, t_end)
+
+    def is_trip_feasible(perm):
+        """Simulate the trip exactly as execution will: charge MINIMALLY at
+        the cheapest reachable station when a leg would otherwise drain the
+        battery. Returns True iff every leg (and final return) completes with
+        non-negative battery."""
+        if not perm:
+            return True
+        n = len(perm)
+        positions = [(wx, wy)] + [(p['x'], p['y']) for p in perm] + [(wx, wy)]
+        carrieds = [0.0] * (n + 1)
+        total_w = 0.0
+        for p in perm:
+            total_w += float(p['weight'])
+        carrieds[0] = total_w
+        for i in range(1, n + 1):
+            carrieds[i] = carrieds[i - 1] - float(perm[i - 1]['weight'])
+        leg_energies = [0.0] * (n + 1)
+        for i in range(n + 1):
+            ld = dist(positions[i], positions[i + 1])
+            leg_energies[i] = ld * (1.0 + carrieds[i])
+        suffix_e = [0.0] * (n + 2)
+        for i in range(n, -1, -1):
+            suffix_e[i] = suffix_e[i + 1] + leg_energies[i]
+        pos = positions[0]
+        battery = BATTERY_CAP
+        SAFETY = 1e-6
+        for i in range(n + 1):
+            target = positions[i + 1]
+            carried = carrieds[i]
+            future_after = suffix_e[i + 1]
+            for _ in range(8):
+                leg_e = dist(pos, target) * (1.0 + carried)
+                if leg_e <= battery + SAFETY:
+                    break
+                if not have_cs:
+                    return False
+                best = None
+                best_extra = INF
+                for cs in cs_points:
+                    e_to = dist(pos, cs) * (1.0 + carried)
+                    if e_to > battery + SAFETY:
+                        continue
+                    e_from = dist(cs, target) * (1.0 + carried)
+                    if e_from > BATTERY_CAP + SAFETY:
+                        continue
+                    extra = e_to + e_from - leg_e
+                    if extra < best_extra:
+                        best_extra = extra
+                        best = (cs, e_to, e_from)
+                if best is None:
+                    return False
+                cs, e_to, e_from = best
+                battery -= e_to
+                pos = cs
+                # Minimum charge: just enough for remainder of trip.
+                needed_from_cs = e_from + future_after
+                target_battery = needed_from_cs
+                if target_battery > BATTERY_CAP:
+                    target_battery = BATTERY_CAP
+                if target_battery > battery:
+                    battery = target_battery
+            else:
+                return False
+            leg_e = dist(pos, target) * (1.0 + carried)
+            if leg_e > battery + SAFETY:
+                return False
+            battery -= leg_e
+            pos = target
+        return True
 
     def best_route_bf(items, depart_t):
         n = len(items)
@@ -398,11 +468,24 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         if not pending:
             break
 
-        pack_a = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
+        # First try the strict no-charge cap so the common case stays cheap
+        # (charging would add detour + charge time = lost on-time deliveries).
+        pack_a = pack_by_deadline(pending, max_payload, depart_t, BATTERY_CAP)
         sa = pack_score(pack_a, depart_t)
         if len(pack_a) >= MAX_TRIP_SIZE and sa[0] == len(pack_a):
             chosen = pack_a
         else:
+            pack_b = pack_by_cluster(pending, max_payload, depart_t, BATTERY_CAP)
+            sb = pack_score(pack_b, depart_t)
+            key_a = (-sa[0], sa[1], sa[2])
+            key_b = (-sb[0], sb[1], sb[2])
+            chosen = pack_a if key_a <= key_b else pack_b
+
+        # Rescue pass: if the strict cap couldn't pack anything but charging
+        # stations are available, try again with the relaxed cap.
+        if not chosen and have_cs and TRIP_ENERGY_CAP > BATTERY_CAP:
+            pack_a = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
+            sa = pack_score(pack_a, depart_t)
             pack_b = pack_by_cluster(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
             sb = pack_score(pack_b, depart_t)
             key_a = (-sa[0], sa[1], sa[2])
@@ -415,19 +498,27 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
 
         ordered, energy, _ot, _t_end = best_route(chosen, depart_t)
 
-        # If no charging stations and energy exceeds cap, drop tail.
-        if not have_cs:
-            while ordered and energy > BATTERY_CAP:
-                drop_idx = 0
-                drop_dl = ordered[0].get('deadline', INF)
-                for k in range(1, len(ordered)):
-                    dlk = ordered[k].get('deadline', INF)
-                    if dlk > drop_dl:
-                        drop_dl = dlk
-                        drop_idx = k
-                ordered.pop(drop_idx)
-                if ordered:
-                    ordered, energy, _ot, _t_end = best_route(ordered, depart_t)
+        # Drop tail (latest deadline first) until the trip is feasible.
+        # Without charging stations, "feasible" means energy <= BATTERY_CAP.
+        # With charging stations, we use a full simulation that inserts
+        # charge stops as needed.
+        def trip_ok(o, e):
+            if not o:
+                return True
+            if have_cs:
+                return is_trip_feasible(o)
+            return e <= BATTERY_CAP
+        while ordered and not trip_ok(ordered, energy):
+            drop_idx = 0
+            drop_dl = ordered[0].get('deadline', INF)
+            for k in range(1, len(ordered)):
+                dlk = ordered[k].get('deadline', INF)
+                if dlk > drop_dl:
+                    drop_dl = dlk
+                    drop_idx = k
+            ordered.pop(drop_idx)
+            if ordered:
+                ordered, energy, _ot, _t_end = best_route(ordered, depart_t)
 
         if not ordered:
             active_drone_ids.remove(did)
@@ -493,7 +584,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                     'x': best_cs[0], 'y': best_cs[1],
                     't': round(st['t'], 6), 'action': 'CHARGE',
                 })
-                # Charge to the minimum needed (capped at BATTERY_CAP).
+                # Charge MINIMALLY: just enough for leg-to-target + remainder of trip.
                 target_battery = needed_from_cs
                 if target_battery > BATTERY_CAP:
                     target_battery = BATTERY_CAP
