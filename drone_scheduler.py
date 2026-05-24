@@ -465,7 +465,10 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
             if e_t > energy_cap:
                 continue
-            if ot_t < chosen_ot:
+            # Require strict on-time gain: this item itself must be on-time
+            # AND no already-packed item becomes late. Wasting energy on a
+            # late item gives 0 on-time score but costs energy + makespan.
+            if ot_t < chosen_ot + 1:
                 continue
             chosen.append(cand)
             cur_w += w
@@ -515,7 +518,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             tentative = chosen + [best_pick]
             nn_ord = nn_order(tentative)
             e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
-            if e_t > energy_cap or ot_t < chosen_ot:
+            if e_t > energy_cap or ot_t < chosen_ot + 1:
                 remaining.remove(best_pick)
                 continue
             chosen.append(best_pick)
