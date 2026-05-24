@@ -105,9 +105,9 @@ static const string& J_str(const JsonVal& v) { return v.s; }
 constexpr double BATTERY_CAP = 500.0;
 constexpr double SPEED = 1.0;
 constexpr double CHARGE_RATE = 2.0;
-constexpr int    MAX_TRIP_SIZE = 18;        // bigger thanks to C++ speed
+constexpr int    MAX_TRIP_SIZE = 12;        // bigger thanks to C++ speed
 constexpr int    MAX_CANDIDATES_SCAN = 200;
-constexpr int    BRUTE_LIMIT = 9;           // 8! = 40320 perms, OK in C++
+constexpr int    BRUTE_LIMIT = 8;           // 8! = 40320 perms, OK in C++
 constexpr double INF_D = 1e18;
 
 double wx, wy;
@@ -581,14 +581,19 @@ static vector<int> pack_by_deadline(const vector<int>& pool, double max_payload,
     return chosen;
 }
 
-static vector<int> pack_by_cluster(const vector<int>& pool, double max_payload, double depart_t, double energy_cap) {
+static vector<int> pack_by_cluster_with_seed(const vector<int>& pool, int seed_offset, double max_payload, double depart_t, double energy_cap) {
     vector<int> chosen;
     if (pool.empty()) return chosen;
     int scan_n = min((int)pool.size(), MAX_CANDIDATES_SCAN);
     vector<int> candidates(pool.begin(), pool.begin() + scan_n);
+    // Find seed_offset-th feasible item (by payload). seed_offset=0 = most urgent.
     int seed_idx = -1;
+    int skipped = 0;
     for (int i = 0; i < (int)candidates.size(); i++) {
-        if (d_w[candidates[i]] <= max_payload) { seed_idx = i; break; }
+        if (d_w[candidates[i]] <= max_payload) {
+            if (skipped == seed_offset) { seed_idx = i; break; }
+            skipped++;
+        }
     }
     if (seed_idx < 0) return chosen;
     chosen.push_back(candidates[seed_idx]);
@@ -852,7 +857,7 @@ int main() {
         }
     }
     have_nfz = !nfz_norm.empty();
-    eval_uses_nfz = have_nfz && N_DEL <= 3000; // higher than Python's 500
+    eval_uses_nfz = have_nfz && N_DEL <= 500; // higher than Python's 500
 
     // --- Drone states ---
     vector<DroneState> states(N_DRONE);
@@ -898,17 +903,30 @@ int main() {
 
         // Pack candidates
         vector<int> pack_a = pack_by_deadline(pending, max_payload, depart_t, BATTERY_CAP);
-        vector<int> pack_b = pack_by_cluster(pending, max_payload, depart_t, BATTERY_CAP);
-        vector<int> pack_ra, pack_rb;
+        // Multi-seed cluster pack: try a few different starting items so we
+        // explore different geographic clusters, not just the most urgent.
+        vector<vector<int>> cluster_packs;
+        for (int s = 0; s < 4; s++) {
+            auto p = pack_by_cluster_with_seed(pending, s, max_payload, depart_t, BATTERY_CAP);
+            if (!p.empty()) cluster_packs.push_back(std::move(p));
+        }
+        vector<int> pack_ra;
+        vector<vector<int>> cluster_packs_r;
         if (have_cs && TRIP_ENERGY_CAP > BATTERY_CAP) {
-            int strict_sz = max((int)pack_a.size(), (int)pack_b.size());
+            int strict_sz = (int)pack_a.size();
+            for (auto& cp : cluster_packs) strict_sz = max(strict_sz, (int)cp.size());
             if (strict_sz < MAX_TRIP_SIZE) {
                 pack_ra = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP);
-                pack_rb = pack_by_cluster(pending, max_payload, depart_t, TRIP_ENERGY_CAP);
+                for (int s = 0; s < 3; s++) {
+                    auto p = pack_by_cluster_with_seed(pending, s, max_payload, depart_t, TRIP_ENERGY_CAP);
+                    if (!p.empty()) cluster_packs_r.push_back(std::move(p));
+                }
             }
         }
 
-        vector<vector<int>*> cands = { &pack_a, &pack_b, &pack_ra, &pack_rb };
+        vector<vector<int>*> cands = { &pack_a, &pack_ra };
+        for (auto& cp : cluster_packs) cands.push_back(&cp);
+        for (auto& cp : cluster_packs_r) cands.push_back(&cp);
         vector<int> best_ordered;
         int best_ot = -1; double best_e = 0, best_t_end = 0;
         bool any = false;
