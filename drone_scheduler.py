@@ -16,33 +16,17 @@ charging_stations = input_data.get('charging_stations', [])
 
 # Start of BODY
 def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
-    """
-    Multi-drone scheduler tuned for the score formula
-        100 * on_time - 0.1 * energy - 0.05 * makespan
-
-    Improvements over earlier revisions:
-      - Skip-if-late per-add filter: candidates whose min-possible arrival
-        already exceeds their deadline are skipped (and globally pruned).
-      - Per-add on-time non-regression: a candidate is rejected if its
-        inclusion makes an already-packed item miss its deadline.
-      - MAX_TRIP_SIZE = 10 with brute-force for n <= 6 and multi-candidate
-        2-opt (NN + deadline-asc + 2-opt) for 7..10.
-      - Drop drone from active set only when it truly has no feasible pack.
-    """
-
     BATTERY_CAP = 500.0
     SPEED = 1.0
     MAX_TRIP_SIZE = 10
     MAX_CANDIDATES_SCAN = 200
-    BRUTE_LIMIT = 6
+    BRUTE_LIMIT = 7
+    INF = float('inf')
 
     wx, wy = warehouse[0], warehouse[1]
-    INF = float('inf')
 
     def dist(a, b):
         return math.hypot(a[0] - b[0], a[1] - b[1])
-
-    # --- No-fly zone helpers -------------------------------------------------
 
     def seg_circle_time_interval(p1, p2, t1, t2, cx, cy, r):
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
@@ -144,14 +128,12 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 return wait_to
         return wait_to
 
-    # --- Routing helpers -----------------------------------------------------
-
-    def nn_order(items):
+    def nn_order_from(items, sx, sy):
         if not items:
             return []
         pool = list(items)
         ordered = []
-        px, py = wx, wy
+        px, py = sx, sy
         while pool:
             best_i = 0
             dx0 = pool[0]['x'] - px
@@ -169,8 +151,10 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             px, py = picked['x'], picked['y']
         return ordered
 
+    def nn_order(items):
+        return nn_order_from(items, wx, wy)
+
     def eval_perm(perm, depart_t):
-        """Return (energy, on_time_count, t_end) for given permutation."""
         if not perm:
             return (0.0, 0, depart_t)
         total_w = 0.0
@@ -238,7 +222,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         return best
 
     def best_route(items, depart_t):
-        """Return (ordered, energy, on_time, t_end)."""
         n = len(items)
         if n == 0:
             return ([], 0.0, 0, depart_t)
@@ -260,6 +243,94 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 best = (list(perm), e, ot, t_end)
         return best
 
+    # --- Packing strategies --------------------------------------------------
+
+    def pack_by_deadline(pool, max_payload, depart_t):
+        """Greedy by deadline-asc; per-add NN-energy + on-time non-regression."""
+        chosen = []
+        cur_w = 0.0
+        chosen_ot = 0
+        scan = min(MAX_CANDIDATES_SCAN, len(pool))
+        for i in range(scan):
+            cand = pool[i]
+            w = float(cand.get('weight', 0))
+            if w > max_payload:
+                continue
+            if cur_w + w > max_payload + 1e-9:
+                continue
+            tentative = chosen + [cand]
+            nn_ord = nn_order(tentative)
+            e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
+            if e_t > BATTERY_CAP:
+                continue
+            if ot_t < chosen_ot:
+                continue
+            chosen.append(cand)
+            cur_w += w
+            chosen_ot = ot_t
+            if len(chosen) >= MAX_TRIP_SIZE:
+                break
+        return chosen
+
+    def pack_by_cluster(pool, max_payload, depart_t):
+        """Pick most urgent first, then prefer items close to current trip
+        centroid; per-add NN-energy + on-time non-regression."""
+        if not pool:
+            return []
+        candidates = pool[:MAX_CANDIDATES_SCAN]
+        chosen = []
+        chosen_ot = 0
+        cur_w = 0.0
+        # Seed with most urgent feasible.
+        seed_idx = None
+        for i in range(len(candidates)):
+            w = float(candidates[i].get('weight', 0))
+            if w <= max_payload:
+                seed_idx = i
+                break
+        if seed_idx is None:
+            return []
+        chosen.append(candidates[seed_idx])
+        cur_w = float(candidates[seed_idx].get('weight', 0))
+        _, chosen_ot, _ = eval_perm(chosen, depart_t)
+        remaining = [c for c in candidates if c is not chosen[0]]
+
+        while len(chosen) < MAX_TRIP_SIZE and remaining:
+            # Centroid of current trip
+            cx = sum(c['x'] for c in chosen) / len(chosen)
+            cy = sum(c['y'] for c in chosen) / len(chosen)
+            # Score each remaining: weighted by deadline rank + distance
+            best_pick = None
+            best_pick_key = None
+            for c in remaining:
+                w = float(c.get('weight', 0))
+                if w > max_payload or cur_w + w > max_payload + 1e-9:
+                    continue
+                d_sq = (c['x'] - cx) ** 2 + (c['y'] - cy) ** 2
+                key = (d_sq, c.get('deadline', INF))
+                if best_pick_key is None or key < best_pick_key:
+                    best_pick_key = key
+                    best_pick = c
+            if best_pick is None:
+                break
+            tentative = chosen + [best_pick]
+            nn_ord = nn_order(tentative)
+            e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
+            if e_t > BATTERY_CAP or ot_t < chosen_ot:
+                remaining.remove(best_pick)
+                continue
+            chosen.append(best_pick)
+            cur_w += float(best_pick.get('weight', 0))
+            chosen_ot = ot_t
+            remaining.remove(best_pick)
+        return chosen
+
+    def pack_score(chosen, depart_t):
+        if not chosen:
+            return (0, 0.0, depart_t)
+        ordered, energy, ot, t_end = best_route(chosen, depart_t)
+        return (ot, energy, t_end)
+
     # --- Drone state ---------------------------------------------------------
 
     states = {}
@@ -275,15 +346,10 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
     active_drone_ids = [dr['id'] for dr in drones]
     pending = sorted(deliveries, key=lambda d: d.get('deadline', INF))
 
-    # Precompute distance from warehouse for each delivery (used for the
-    # min-arrival lower-bound filter).
     for d in pending:
         d['_w_dist'] = math.hypot(float(d['x']) - wx, float(d['y']) - wy)
 
-    # --- Main scheduling loop -----------------------------------------------
-
     while active_drone_ids and pending:
-        # Pick drone with the earliest free time.
         did = active_drone_ids[0]
         best_t = states[did]['t']
         for i in range(1, len(active_drone_ids)):
@@ -295,12 +361,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         depart_t = st['t']
         max_payload = float(st['drone'].get('max_payload', 0))
 
-        # Pre-filter pending: drop items whose direct-from-warehouse arrival
-        # from the earliest-free drone (= this drone) already exceeds their
-        # deadline. Drone-times only increase, so these items can never be
-        # delivered on-time by any drone -- dropping them avoids wasted energy
-        # and stops the candidate scan window from filling with skip-late
-        # entries.
         new_pending = []
         for d in pending:
             if depart_t + d['_w_dist'] / SPEED <= d.get('deadline', INF):
@@ -309,57 +369,25 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         if not pending:
             break
 
-        # Pack greedily by deadline, with multiple per-add filters:
-        #   - payload fit
-        #   - skip-if-late (min arrival > deadline)
-        #   - NN energy fit
-        #   - on-time non-regression
-        chosen = []
-        chosen_ids = set()
-        cur_weight = 0.0
-        chosen_ot = 0  # current chosen trip on-time count (via NN)
-
-        scan_limit = MAX_CANDIDATES_SCAN
-        if scan_limit > len(pending):
-            scan_limit = len(pending)
-
-        for i in range(scan_limit):
-            cand = pending[i]
-            w = float(cand.get('weight', 0))
-            if w > max_payload:
-                continue
-            if cur_weight + w > max_payload + 1e-9:
-                continue
-            dl = cand.get('deadline', INF)
-            if depart_t + cand['_w_dist'] / SPEED > dl:
-                # Even the most direct path makes this item late: skip.
-                continue
-            tentative = chosen + [cand]
-            nn_ord = nn_order(tentative)
-            e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
-            if e_t > BATTERY_CAP:
-                continue
-            # On-time non-regression: require that adding this item produces
-            # at least as many on-time deliveries as before plus one (cand
-            # itself being on-time). If it drops on-time count below current,
-            # skip; the candidate is causing other items to miss deadlines.
-            if False:
-                continue
-            chosen.append(cand)
-            chosen_ids.add(cand['id'])
-            cur_weight += w
-            chosen_ot = ot_t
-            if len(chosen) >= MAX_TRIP_SIZE:
-                break
+        # Try deadline-greedy first; only invoke the cluster strategy when
+        # the deadline pack didn't fill the trip with all-on-time items.
+        pack_a = pack_by_deadline(pending, max_payload, depart_t)
+        sa = pack_score(pack_a, depart_t)
+        if len(pack_a) >= MAX_TRIP_SIZE and sa[0] == len(pack_a):
+            chosen = pack_a
+        else:
+            pack_b = pack_by_cluster(pending, max_payload, depart_t)
+            sb = pack_score(pack_b, depart_t)
+            key_a = (-sa[0], sa[1], sa[2])
+            key_b = (-sb[0], sb[1], sb[2])
+            chosen = pack_a if key_a <= key_b else pack_b
 
         if not chosen:
             active_drone_ids.remove(did)
             continue
 
-        # Final route optimization (brute force for small, multi-candidate for larger).
         ordered, energy, _ot, _t_end = best_route(chosen, depart_t)
 
-        # Safety: drop tail if energy still exceeds cap (rare due to per-add check).
         while ordered and energy > BATTERY_CAP:
             drop_idx = 0
             drop_dl = ordered[0].get('deadline', INF)
