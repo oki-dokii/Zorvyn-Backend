@@ -105,9 +105,9 @@ static const string& J_str(const JsonVal& v) { return v.s; }
 constexpr double BATTERY_CAP = 500.0;
 constexpr double SPEED = 1.0;
 constexpr double CHARGE_RATE = 2.0;
-constexpr int    MAX_TRIP_SIZE = 12;        // bigger thanks to C++ speed
+constexpr int    MAX_TRIP_SIZE = 14;        // bigger thanks to C++ speed
 constexpr int    MAX_CANDIDATES_SCAN = 200;
-constexpr int    BRUTE_LIMIT = 8;           // 8! = 40320 perms, OK in C++
+constexpr int    BRUTE_LIMIT = 9;           // 8! = 40320 perms, OK in C++
 constexpr double INF_D = 1e18;
 
 double wx, wy;
@@ -520,6 +520,36 @@ static void two_opt(vector<int>& perm, double depart_t, int max_rounds = 3) {
     }
 }
 
+static void or_opt(vector<int>& perm, double depart_t, int max_rounds = 2) {
+    int n = (int)perm.size();
+    if (n < 4) return;
+    double best_e, best_t_end; int best_ot;
+    eval_perm(perm.data(), n, depart_t, best_e, best_ot, best_t_end);
+    vector<int> tmp;
+    for (int r = 0; r < max_rounds; r++) {
+        bool improved = false;
+        for (int i = 0; i < n; i++) {
+            int item = perm[i];
+            for (int j = 0; j < n; j++) {
+                if (j == i) continue;
+                tmp = perm;
+                tmp.erase(tmp.begin() + i);
+                int insert_pos = j < i ? j : j - 1;
+                tmp.insert(tmp.begin() + insert_pos, item);
+                double e, t_end; int ot;
+                eval_perm(tmp.data(), n, depart_t, e, ot, t_end);
+                if (-ot < -best_ot || (-ot == -best_ot && (e < best_e || (e == best_e && t_end < best_t_end)))) {
+                    best_ot = ot; best_e = e; best_t_end = t_end;
+                    perm = tmp;
+                    improved = true;
+                    item = perm[i]; // updated index may differ but we re-scan
+                }
+            }
+        }
+        if (!improved) break;
+    }
+}
+
 static void best_route(const vector<int>& items, double depart_t,
                        vector<int>& out_ordered, double& out_e, int& out_ot, double& out_t_end) {
     int n = (int)items.size();
@@ -532,8 +562,8 @@ static void best_route(const vector<int>& items, double depart_t,
     vector<int> nn; nn_order(items, nn);
     vector<int> dl_sorted = items;
     sort(dl_sorted.begin(), dl_sorted.end(), [](int a, int b) { return d_dl[a] < d_dl[b]; });
-    vector<int> opt_nn = nn;  two_opt(opt_nn, depart_t);
-    vector<int> opt_dl = dl_sorted; two_opt(opt_dl, depart_t);
+    vector<int> opt_nn = nn;  two_opt(opt_nn, depart_t); or_opt(opt_nn, depart_t);
+    vector<int> opt_dl = dl_sorted; two_opt(opt_dl, depart_t); or_opt(opt_dl, depart_t);
     vector<vector<int>*> cands = { &nn, &dl_sorted, &opt_nn, &opt_dl };
     int best_ot = -1; double best_e = 0, best_t_end = 0;
     bool first = true;
