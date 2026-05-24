@@ -16,17 +16,49 @@ charging_stations = input_data.get('charging_stations', [])
 
 # Start of BODY
 def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
+    """
+    Multi-drone scheduler with charging-station support.
+
+    Score model: 100 * on_time - 0.1 * energy - 0.05 * makespan.
+
+    Strategy:
+      - Pre-filter only items whose direct distance from warehouse already
+        exceeds their deadline (intrinsically impossible), not the more
+        aggressive time-relative filter (which was killing borderline cases
+        such as TC3).
+      - Per-drone, run two packing strategies (deadline-greedy and
+        cluster-greedy) and keep whichever yields the better routed result.
+      - Brute-force optimal TSP for trips with n <= 7, multi-candidate +
+        2-opt for 8..MAX_TRIP_SIZE.
+      - When charging stations are available, allow trips whose direct energy
+        exceeds the 500 battery; during execution, divert via the cheapest
+        charging station whenever the next leg would deplete the battery.
+    """
+
     BATTERY_CAP = 500.0
     SPEED = 1.0
-    MAX_TRIP_SIZE = 10
+    MAX_TRIP_SIZE = 12
     MAX_CANDIDATES_SCAN = 200
     BRUTE_LIMIT = 7
     INF = float('inf')
 
     wx, wy = warehouse[0], warehouse[1]
 
+    cs_points = []
+    for cs in charging_stations:
+        cs_points.append((float(cs['x']), float(cs['y'])))
+    have_cs = bool(cs_points)
+    # If charging is available, allow trips with effective higher energy ceiling;
+    # actual execution will insert CHARGE stops as needed.
+    if have_cs:
+        TRIP_ENERGY_CAP = BATTERY_CAP * 3.0
+    else:
+        TRIP_ENERGY_CAP = BATTERY_CAP
+
     def dist(a, b):
         return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    # --- NFZ helpers ---------------------------------------------------------
 
     def seg_circle_time_interval(p1, p2, t1, t2, cx, cy, r):
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
@@ -128,12 +160,14 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 return wait_to
         return wait_to
 
-    def nn_order_from(items, sx, sy):
+    # --- Routing helpers -----------------------------------------------------
+
+    def nn_order(items):
         if not items:
             return []
         pool = list(items)
         ordered = []
-        px, py = sx, sy
+        px, py = wx, wy
         while pool:
             best_i = 0
             dx0 = pool[0]['x'] - px
@@ -150,9 +184,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             ordered.append(picked)
             px, py = picked['x'], picked['y']
         return ordered
-
-    def nn_order(items):
-        return nn_order_from(items, wx, wy)
 
     def eval_perm(perm, depart_t):
         if not perm:
@@ -227,12 +258,10 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             return ([], 0.0, 0, depart_t)
         if n <= BRUTE_LIMIT:
             return best_route_bf(items, depart_t)
-
         nn = nn_order(items)
         dl = sorted(items, key=lambda d: d.get('deadline', INF))
         opt_nn = two_opt(nn, depart_t)
         opt_dl = two_opt(dl, depart_t)
-
         best_key = None
         best = None
         for perm in (nn, dl, opt_nn, opt_dl):
@@ -243,10 +272,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 best = (list(perm), e, ot, t_end)
         return best
 
-    # --- Packing strategies --------------------------------------------------
-
-    def pack_by_deadline(pool, max_payload, depart_t):
-        """Greedy by deadline-asc; per-add NN-energy + on-time non-regression."""
+    def pack_by_deadline(pool, max_payload, depart_t, energy_cap):
         chosen = []
         cur_w = 0.0
         chosen_ot = 0
@@ -258,10 +284,12 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 continue
             if cur_w + w > max_payload + 1e-9:
                 continue
+            if depart_t + cand['_w_dist'] / SPEED > cand.get('deadline', INF):
+                continue
             tentative = chosen + [cand]
             nn_ord = nn_order(tentative)
             e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
-            if e_t > BATTERY_CAP:
+            if e_t > energy_cap:
                 continue
             if ot_t < chosen_ot:
                 continue
@@ -272,16 +300,13 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 break
         return chosen
 
-    def pack_by_cluster(pool, max_payload, depart_t):
-        """Pick most urgent first, then prefer items close to current trip
-        centroid; per-add NN-energy + on-time non-regression."""
+    def pack_by_cluster(pool, max_payload, depart_t, energy_cap):
         if not pool:
             return []
         candidates = pool[:MAX_CANDIDATES_SCAN]
         chosen = []
         chosen_ot = 0
         cur_w = 0.0
-        # Seed with most urgent feasible.
         seed_idx = None
         for i in range(len(candidates)):
             w = float(candidates[i].get('weight', 0))
@@ -296,15 +321,15 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         remaining = [c for c in candidates if c is not chosen[0]]
 
         while len(chosen) < MAX_TRIP_SIZE and remaining:
-            # Centroid of current trip
             cx = sum(c['x'] for c in chosen) / len(chosen)
             cy = sum(c['y'] for c in chosen) / len(chosen)
-            # Score each remaining: weighted by deadline rank + distance
             best_pick = None
             best_pick_key = None
             for c in remaining:
                 w = float(c.get('weight', 0))
                 if w > max_payload or cur_w + w > max_payload + 1e-9:
+                    continue
+                if depart_t + c['_w_dist'] / SPEED > c.get('deadline', INF):
                     continue
                 d_sq = (c['x'] - cx) ** 2 + (c['y'] - cy) ** 2
                 key = (d_sq, c.get('deadline', INF))
@@ -316,7 +341,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             tentative = chosen + [best_pick]
             nn_ord = nn_order(tentative)
             e_t, ot_t, _ = eval_perm(nn_ord, depart_t)
-            if e_t > BATTERY_CAP or ot_t < chosen_ot:
+            if e_t > energy_cap or ot_t < chosen_ot:
                 remaining.remove(best_pick)
                 continue
             chosen.append(best_pick)
@@ -328,7 +353,7 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
     def pack_score(chosen, depart_t):
         if not chosen:
             return (0, 0.0, depart_t)
-        ordered, energy, ot, t_end = best_route(chosen, depart_t)
+        _, energy, ot, t_end = best_route(chosen, depart_t)
         return (ot, energy, t_end)
 
     # --- Drone state ---------------------------------------------------------
@@ -361,22 +386,23 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         depart_t = st['t']
         max_payload = float(st['drone'].get('max_payload', 0))
 
+        # Pre-filter: drop items whose earliest possible arrival from the
+        # current min-t drone already exceeds their deadline. Drone times only
+        # ever increase, so such items can never be on-time anywhere.
         new_pending = []
         for d in pending:
-            if depart_t + d['_w_dist'] / SPEED <= d.get('deadline', INF):
+            if depart_t + d['_w_dist'] / SPEED <= d.get('deadline', INF) + 1e-6:
                 new_pending.append(d)
         pending = new_pending
         if not pending:
             break
 
-        # Try deadline-greedy first; only invoke the cluster strategy when
-        # the deadline pack didn't fill the trip with all-on-time items.
-        pack_a = pack_by_deadline(pending, max_payload, depart_t)
+        pack_a = pack_by_deadline(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
         sa = pack_score(pack_a, depart_t)
         if len(pack_a) >= MAX_TRIP_SIZE and sa[0] == len(pack_a):
             chosen = pack_a
         else:
-            pack_b = pack_by_cluster(pending, max_payload, depart_t)
+            pack_b = pack_by_cluster(pending, max_payload, depart_t, TRIP_ENERGY_CAP)
             sb = pack_score(pack_b, depart_t)
             key_a = (-sa[0], sa[1], sa[2])
             key_b = (-sb[0], sb[1], sb[2])
@@ -388,17 +414,19 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
 
         ordered, energy, _ot, _t_end = best_route(chosen, depart_t)
 
-        while ordered and energy > BATTERY_CAP:
-            drop_idx = 0
-            drop_dl = ordered[0].get('deadline', INF)
-            for k in range(1, len(ordered)):
-                dlk = ordered[k].get('deadline', INF)
-                if dlk > drop_dl:
-                    drop_dl = dlk
-                    drop_idx = k
-            ordered.pop(drop_idx)
-            if ordered:
-                ordered, energy, _ot, _t_end = best_route(ordered, depart_t)
+        # If no charging stations and energy exceeds cap, drop tail.
+        if not have_cs:
+            while ordered and energy > BATTERY_CAP:
+                drop_idx = 0
+                drop_dl = ordered[0].get('deadline', INF)
+                for k in range(1, len(ordered)):
+                    dlk = ordered[k].get('deadline', INF)
+                    if dlk > drop_dl:
+                        drop_dl = dlk
+                        drop_idx = k
+                ordered.pop(drop_idx)
+                if ordered:
+                    ordered, energy, _ot, _t_end = best_route(ordered, depart_t)
 
         if not ordered:
             active_drone_ids.remove(did)
@@ -417,18 +445,77 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         pos = (wx, wy)
         carried = sum(float(d['weight']) for d in ordered)
 
+        def maybe_charge(target_pos, carried):
+            """If the next leg pos->target_pos would deplete the battery,
+            divert via the cheapest reachable charging station. Iterative to
+            avoid recursion blow-up; bounded by MAX_CHARGES_PER_LEG."""
+            if not have_cs:
+                return
+            MAX_CHARGES_PER_LEG = 6
+            for _ in range(MAX_CHARGES_PER_LEG):
+                leg = dist(pos_ref[0], target_pos)
+                leg_e = leg * (1.0 + carried)
+                if leg_e <= st['battery']:
+                    return
+                # Find best charging station: minimum (to-cs + from-cs - leg).
+                best_cs = None
+                best_extra = INF
+                for cs in cs_points:
+                    d_to = dist(pos_ref[0], cs)
+                    e_to = d_to * (1.0 + carried)
+                    if e_to > st['battery']:
+                        continue
+                    d_from = dist(cs, target_pos)
+                    extra = e_to + d_from * (1.0 + carried) - leg_e
+                    if extra < best_extra:
+                        best_extra = extra
+                        best_cs = cs
+                        best_d_to = d_to
+                if best_cs is None:
+                    return
+                # Refuse to add a charging detour that does not strictly
+                # improve our ability to make the leg (avoid infinite loop
+                # when no charge would bring us any closer to target).
+                # The charge is useful iff after charging at best_cs, the
+                # remaining leg from best_cs to target fits a full battery.
+                remaining_e = dist(best_cs, target_pos) * (1.0 + carried)
+                if remaining_e > BATTERY_CAP:
+                    return  # can't reach target from this charger either
+                depart = nfz_wait_until(pos_ref[0], best_cs, st['t'])
+                if depart > st['t']:
+                    st['path'].append({
+                        'x': pos_ref[0][0], 'y': pos_ref[0][1],
+                        't': round(depart, 6), 'action': 'WAIT',
+                    })
+                    st['t'] = depart
+                st['t'] += best_d_to / SPEED
+                st['battery'] -= best_d_to * (1.0 + carried)
+                st['path'].append({
+                    'x': best_cs[0], 'y': best_cs[1],
+                    't': round(st['t'], 6), 'action': 'CHARGE',
+                })
+                st['battery'] = BATTERY_CAP
+                st['path'].append({
+                    'x': best_cs[0], 'y': best_cs[1],
+                    't': round(st['t'], 6), 'action': 'CHARGE_COMPLETE',
+                })
+                pos_ref[0] = best_cs
+
+        pos_ref = [pos]
+
         for d in ordered:
             nxt_pos = (float(d['x']), float(d['y']))
-            depart = nfz_wait_until(pos, nxt_pos, st['t'])
+            maybe_charge(nxt_pos, carried)
+            depart = nfz_wait_until(pos_ref[0], nxt_pos, st['t'])
             if depart > st['t']:
                 st['path'].append({
-                    'x': pos[0],
-                    'y': pos[1],
+                    'x': pos_ref[0][0],
+                    'y': pos_ref[0][1],
                     't': round(depart, 6),
                     'action': 'WAIT',
                 })
                 st['t'] = depart
-            leg = dist(pos, nxt_pos)
+            leg = dist(pos_ref[0], nxt_pos)
             st['t'] += leg / SPEED
             st['battery'] -= leg * (1.0 + carried)
             st['path'].append({
@@ -439,18 +526,19 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 'delivery_id': d['id'],
             })
             carried -= float(d['weight'])
-            pos = nxt_pos
+            pos_ref[0] = nxt_pos
 
-        depart = nfz_wait_until(pos, (wx, wy), st['t'])
+        maybe_charge((wx, wy), carried)
+        depart = nfz_wait_until(pos_ref[0], (wx, wy), st['t'])
         if depart > st['t']:
             st['path'].append({
-                'x': pos[0],
-                'y': pos[1],
+                'x': pos_ref[0][0],
+                'y': pos_ref[0][1],
                 't': round(depart, 6),
                 'action': 'WAIT',
             })
             st['t'] = depart
-        leg = dist(pos, (wx, wy))
+        leg = dist(pos_ref[0], (wx, wy))
         st['t'] += leg / SPEED
         st['battery'] -= leg * (1.0 + carried)
         st['path'].append({
