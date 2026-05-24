@@ -2,6 +2,7 @@
 import json
 import sys
 import math
+from itertools import permutations
 
 input_data = json.loads(sys.stdin.read())
 
@@ -16,17 +17,26 @@ charging_stations = input_data.get('charging_stations', [])
 # Start of BODY
 def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
     """
-    Greedy multi-delivery scheduler optimized for large inputs.
+    Greedy multi-delivery scheduler with brute-force per-trip routing.
 
-    Per-trip cost is bounded by MAX_CANDIDATES_SCAN and MAX_TRIP_SIZE, so
-    total work is roughly O(N) in the number of deliveries plus O(D) drone
-    selection per trip. Nearest-neighbor ordering and energy estimation only
-    run once per trip (after packing), not per candidate.
+    Strategy:
+      - Sort pending deliveries by deadline (earliest first).
+      - Repeatedly schedule the drone with the earliest free time.
+      - Pack a trip greedily from deadline-sorted candidates while respecting
+        the drone's max_payload (cap MAX_TRIP_SIZE, scan MAX_CANDIDATES_SCAN).
+      - Brute-force the optimal route for the packed trip: maximize on-time
+        deliveries first, break ties by minimum energy, then minimum makespan.
+        This is the key score driver: each on-time delivery is worth 100
+        whereas energy/makespan penalties are weighted 0.1/0.05.
+      - If the optimal route exceeds the battery, drop the least-urgent item
+        (latest deadline) and re-optimize until it fits.
+      - Per leg, wait at the prior point until any active no-fly zone closes.
+      - Return to the warehouse to recharge.
     """
 
     BATTERY_CAP = 500.0
     SPEED = 1.0
-    MAX_TRIP_SIZE = 6
+    MAX_TRIP_SIZE = 6  # brute force is 720 perms at 6
     MAX_CANDIDATES_SCAN = 200
 
     wx, wy = warehouse[0], warehouse[1]
@@ -136,51 +146,66 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
                 return wait_to
         return wait_to
 
-    # --- Trip helpers --------------------------------------------------------
+    # --- Trip routing: brute-force optimal permutation -----------------------
 
-    def nearest_neighbor_order(start_x, start_y, items):
-        if not items:
-            return []
-        pool = list(items)
-        ordered = []
-        px, py = start_x, start_y
-        while pool:
-            best_i = 0
-            dx0 = pool[0]['x'] - px
-            dy0 = pool[0]['y'] - py
-            best_d = dx0 * dx0 + dy0 * dy0
-            for i in range(1, len(pool)):
-                dxi = pool[i]['x'] - px
-                dyi = pool[i]['y'] - py
-                d = dxi * dxi + dyi * dyi
-                if d < best_d:
-                    best_d = d
-                    best_i = i
-            picked = pool.pop(best_i)
-            ordered.append(picked)
-            px, py = picked['x'], picked['y']
-        return ordered
+    def best_route(items, depart_t):
+        """Return (ordered_items, energy, t_end).
 
-    def trip_energy(ordered):
-        if not ordered:
-            return 0.0
-        carried = 0.0
-        for d in ordered:
-            carried += float(d['weight'])
-        px, py = wx, wy
-        e = 0.0
-        for d in ordered:
-            dx_ = px - d['x']
-            dy_ = py - d['y']
-            leg = math.sqrt(dx_ * dx_ + dy_ * dy_)
-            e += leg * (1.0 + carried)
-            carried -= float(d['weight'])
-            px, py = d['x'], d['y']
-        dx_ = px - wx
-        dy_ = py - wy
-        leg = math.sqrt(dx_ * dx_ + dy_ * dy_)
-        e += leg
-        return e
+        Maximize on-time count, tie-break by minimum energy, then makespan.
+        Energy includes the full forward legs (with decreasing payload) plus
+        the return leg back to the warehouse.
+        """
+        n = len(items)
+        if n == 0:
+            return ([], 0.0, depart_t)
+        if n == 1:
+            d = items[0]
+            leg = math.hypot(d['x'] - wx, d['y'] - wy)
+            w = float(d['weight'])
+            t_arr = depart_t + leg / SPEED
+            t_end = t_arr + leg / SPEED
+            e = leg * (1.0 + w) + leg
+            return ([d], e, t_end)
+
+        total_w = 0.0
+        for d in items:
+            total_w += float(d['weight'])
+
+        best_key = None
+        best_perm = None
+        best_e = 0.0
+        best_t_end = depart_t
+
+        for perm in permutations(items):
+            t = depart_t
+            carried = total_w
+            e = 0.0
+            on_time = 0
+            px, py = wx, wy
+            for d in perm:
+                dxv = px - d['x']
+                dyv = py - d['y']
+                leg = math.sqrt(dxv * dxv + dyv * dyv)
+                t += leg / SPEED
+                e += leg * (1.0 + carried)
+                dl = d.get('deadline', float('inf'))
+                if t <= dl:
+                    on_time += 1
+                carried -= float(d['weight'])
+                px, py = d['x'], d['y']
+            dxv = px - wx
+            dyv = py - wy
+            leg_r = math.sqrt(dxv * dxv + dyv * dyv)
+            e += leg_r
+            t_end = t + leg_r / SPEED
+            key = (-on_time, e, t_end)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_perm = perm
+                best_e = e
+                best_t_end = t_end
+
+        return (list(best_perm), best_e, best_t_end)
 
     # --- Drone state ---------------------------------------------------------
 
@@ -200,7 +225,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
     # --- Main scheduling loop -----------------------------------------------
 
     while active_drone_ids and pending:
-        # Pick drone with earliest free time
         did = active_drone_ids[0]
         best_t = states[did]['t']
         for i in range(1, len(active_drone_ids)):
@@ -211,7 +235,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         st = states[did]
         max_payload = float(st['drone'].get('max_payload', 0))
 
-        # Pack greedily from front of (deadline-sorted) pending
         chosen = []
         chosen_ids = set()
         cur_weight = 0.0
@@ -235,13 +258,24 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
             active_drone_ids.remove(did)
             continue
 
-        ordered = nearest_neighbor_order(wx, wy, chosen)
-        while ordered and trip_energy(ordered) > BATTERY_CAP:
-            dropped = ordered.pop()
-            chosen_ids.discard(dropped['id'])
+        ordered, energy, _t_end = best_route(chosen, st['t'])
+        while ordered and energy > BATTERY_CAP:
+            # drop the least-urgent (latest deadline) item and re-optimize
+            drop_idx = 0
+            drop_dl = ordered[0].get('deadline', float('inf'))
+            for i in range(1, len(ordered)):
+                dli = ordered[i].get('deadline', float('inf'))
+                if dli > drop_dl:
+                    drop_dl = dli
+                    drop_idx = i
+            ordered.pop(drop_idx)
+            ordered, energy, _t_end = best_route(ordered, st['t'])
+
         if not ordered:
             active_drone_ids.remove(did)
             continue
+
+        chosen_ids = {d['id'] for d in ordered}
 
         st['path'].append({
             'x': wx,
@@ -299,7 +333,6 @@ def solve(warehouse, drones, deliveries, no_fly_zones, charging_stations):
         st['battery'] = BATTERY_CAP
         st['pos'] = (wx, wy)
 
-        # Drop delivered from pending in O(len(pending)) once per trip
         if chosen_ids:
             pending = [d for d in pending if d['id'] not in chosen_ids]
 
